@@ -1,0 +1,25 @@
+[package]
+name = "wooting-shouting"
+version = "0.1.0"
+edition = "2021"
+
+links = "hidapi-hidraw"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.71"
+chrono = "0.4.24"
+env_logger = "0.10.0"
+hidapi = { version = "2.3.3", features = ["linux-static-hidraw"], default-features = false }
+lazy_static = "1.4.0"
+
+log = "0.4.17"
+serde = { version = "1.0.163", features = ["derive"] }
+timer = "0.2.0"
+wooting-analog-plugin-dev = "0.7.1"
+
+[build-dependencies]
+pkg-config = "0.3.27"
+#wooting-analog-wrapper = { git = "https://github.com/WootingKb/wooting-analog-sdk", branch = "develop", features = ["serdes"] }
+#wooting-analog-plugin = { path = "../../web/wooting-analog-sdk/wooting-analog-plugin" }
