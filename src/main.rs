@@ -1,18 +1,21 @@
-
 //extern crate wooting_analog_wrapper;
 use wooting_analog_plugin_dev::wooting_analog_common as wooting;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 //use wooting_analog_wrapper as sdk;
 
 //pub use sdk::{DeviceInfo, FromPrimitive, HIDCodes, ToPrimitive, WootingAnalogResult};
 
-use std::{collections::{HashMap, HashSet}, thread, time::Duration};
 use anyhow::{Context, Result};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 //use sdk::SDKResult;
-use log::*;
 use env_logger;
+use log::*;
 
 mod hid;
 
@@ -20,7 +23,7 @@ struct KeyState {
     press_out_started: bool,
     press_out_fired: bool,
     press_in_start_time: std::time::Instant,
-    press_in_value: f32
+    press_in_value: f32,
 }
 
 impl KeyState {
@@ -29,19 +32,19 @@ impl KeyState {
             press_out_started: false,
             press_out_fired: false,
             press_in_start_time: std::time::Instant::now(),
-            press_in_value: 0.0
-        }
+            press_in_value: 0.0,
+        };
     }
 }
 struct KeyWatcher {
-    keys: HashMap<u16, KeyState>
+    keys: HashMap<u16, KeyState>,
 }
 
 impl KeyWatcher {
     fn new() -> Self {
         return Self {
-            keys: HashMap::<_,_>::with_capacity(255)
-        }
+            keys: HashMap::<_, _>::with_capacity(255),
+        };
     }
     fn get_key_state(&mut self, code: u16) -> &mut KeyState {
         if !self.keys.contains_key(&code) {
@@ -64,7 +67,7 @@ impl KeyWatcher {
                 let diff = value - last_value;
                 let now = std::time::Instant::now();
                 let tdiff = now - s.press_in_start_time;
-                let diffbyt = diff/tdiff.as_secs_f32();
+                let diffbyt = diff / tdiff.as_secs_f32();
                 if diff != 0.0 {
                     info!("diff for {code} is {diffbyt}");
                     s.press_out_started = true;
@@ -77,22 +80,22 @@ impl KeyWatcher {
                     s.press_in_start_time = s.press_in_start_time;
                     s.press_in_value = *value;
                 }
-            },
+            }
             (true, true, true) => {
                 s.press_in_value = *value;
-            },
+            }
             (true, true, false) => {
                 s.press_out_started = false;
                 s.press_out_fired = false;
                 s.press_in_start_time = s.press_in_start_time;
                 s.press_in_value = *value;
-            },
+            }
             (false, _, true) => {
                 s.press_out_started = true;
                 s.press_out_fired = false;
                 s.press_in_start_time = std::time::Instant::now();
                 s.press_in_value = *value;
-            },
+            }
             (false, _, false) => {
                 s.press_out_started = false;
                 s.press_out_fired = false;
@@ -105,7 +108,7 @@ impl KeyWatcher {
 
 fn main() {
     let mut reader = hid::WootingPlugin::new();
-    let cb = |ev: wooting::DeviceEventType, info: &wooting::DeviceInfo| { };
+    let cb = |ev: wooting::DeviceEventType, info: &wooting::DeviceInfo| {};
     let res = reader.initialise(Box::new(cb));
     let Ok((l, rx)) = res.0 else {
         panic!("failed to init")

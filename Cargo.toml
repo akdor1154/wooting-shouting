@@ -11,7 +11,9 @@ links = "hidapi-hidraw"
 anyhow = "1.0.71"
 chrono = "0.4.24"
 env_logger = "0.10.0"
-hidapi = { version = "2.3.3", features = ["linux-static-hidraw"], default-features = false }
+hidapi = { version = "2.3.3", features = [
+	"linux-static-hidraw",
+], default-features = false }
 lazy_static = "1.4.0"
 
 log = "0.4.17"
