@@ -19,26 +19,26 @@ use log::*;
 
 mod hid;
 
-struct KeyState {
-    press_out_started: bool,
-    press_out_fired: bool,
-    press_in_start_time: std::time::Instant,
-    press_in_value: f32,
+// struct KeyState {
+//     press_out_started: bool,
+//     press_out_fired: bool,
+//     press_in_start_time: std::time::Instant,
+//     press_in_value: f32,
+// }
+enum KeyState {
+    Released,
+    PressStarted {
+        start_time: std::time::Instant,
+        current_value: f32,
+    },
+    PressFired,
 }
 
-impl KeyState {
-    fn new() -> Self {
-        return Self {
-            press_out_started: false,
-            press_out_fired: false,
-            press_in_start_time: std::time::Instant::now(),
-            press_in_value: 0.0,
-        };
-    }
-}
 struct KeyWatcher {
     keys: HashMap<u16, KeyState>,
 }
+
+const THRESHOLD: f32 = 0.5;
 
 impl KeyWatcher {
     fn new() -> Self {
@@ -48,59 +48,59 @@ impl KeyWatcher {
     }
     fn get_key_state(&mut self, code: u16) -> &mut KeyState {
         if !self.keys.contains_key(&code) {
-            self.keys.insert(code, KeyState::new());
+            self.keys.insert(code, KeyState::Released);
         }
         return self.keys.get_mut(&code).unwrap();
     }
 
     fn take_input(&mut self, input: &hid::ReadKey) {
         let (code, value) = input;
-        let mut s = self.get_key_state(*code);
+        let s = self.get_key_state(*code);
 
         //let code = key_id.to_u16().expect("Failed to convert HIDCode to u16");
         //let value = analog_data.get(&code).unwrap_or(&0.0);
 
         //info!("val for {code} is {value}");
-        match (s.press_out_started, s.press_out_fired, *value > 0.0) {
-            (true, false, _) => {
-                let last_value = s.press_in_value;
-                let diff = value - last_value;
-                let now = std::time::Instant::now();
-                let tdiff = now - s.press_in_start_time;
-                let diffbyt = diff / tdiff.as_secs_f32();
-                if diff != 0.0 {
-                    info!("diff for {code} is {diffbyt}");
-                    s.press_out_started = true;
-                    s.press_out_fired = true;
-                    s.press_in_start_time = s.press_in_start_time;
-                    s.press_in_value = *value;
+        match (&s, *value > 0.0) {
+            (
+                KeyState::PressStarted {
+                    start_time,
+                    current_value,
+                },
+                _,
+            ) => {
+                // started release
+                if *value > THRESHOLD {
+                    let now = std::time::Instant::now();
+                    let tdiff = now - *start_time;
+
+                    let last_value = *current_value;
+
+                    let diff = (*value - last_value) / tdiff.as_secs_f32();
+
+                    info!("diff for {code} is {diff}");
+                    *s = KeyState::PressFired
                 } else {
-                    s.press_out_started = true;
-                    s.press_out_fired = false;
-                    s.press_in_start_time = s.press_in_start_time;
-                    s.press_in_value = *value;
+                    *s = KeyState::PressStarted {
+                        start_time: *start_time,
+                        current_value: *value,
+                    };
                 }
             }
-            (true, true, true) => {
-                s.press_in_value = *value;
+            (KeyState::PressFired, true) => {
+                //*s = *s;
             }
-            (true, true, false) => {
-                s.press_out_started = false;
-                s.press_out_fired = false;
-                s.press_in_start_time = s.press_in_start_time;
-                s.press_in_value = *value;
+            (KeyState::PressFired, false) => {
+                *s = KeyState::Released;
             }
-            (false, _, true) => {
-                s.press_out_started = true;
-                s.press_out_fired = false;
-                s.press_in_start_time = std::time::Instant::now();
-                s.press_in_value = *value;
+            (KeyState::Released, true) => {
+                *s = KeyState::PressStarted {
+                    start_time: std::time::Instant::now(),
+                    current_value: *value,
+                };
             }
-            (false, _, false) => {
-                s.press_out_started = false;
-                s.press_out_fired = false;
-                s.press_in_start_time = s.press_in_start_time;
-                s.press_in_value = *value;
+            (KeyState::Released, false) => {
+                *s = KeyState::Released;
             }
         }
     }
