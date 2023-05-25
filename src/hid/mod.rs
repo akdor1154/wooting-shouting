@@ -1,3 +1,4 @@
+use input_linux::Key;
 use log;
 extern crate hidapi;
 
@@ -13,6 +14,9 @@ use log::{error, info};
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::os::raw::{c_float, c_ushort};
+use std::os::unix::prelude::OpenOptionsExt;
+
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -96,10 +100,11 @@ trait DeviceImplementation: Send + Sync {
 				//.take(max_length) //Only take up to the max length of results. Doing this
 				.filter(|&s| s[0] != 0 || s[1] != 0) //Get rid of entries where the code is 0
 				.map(|s| {
-					(
-						((u16::from(s[0])) << 8) | u16::from(s[1]), // Convert the first 2 bytes into the u16 code
-						self.analog_value_to_float(s[2]),           //Convert the remaining byte into the float analog value
-					)
+					ReadKey {
+						code: ((u16::from(s[0])) << 8) | u16::from(s[1]), // Convert the first 2 bytes into the u16 code
+						value: self.analog_value_to_float(s[2]), //Convert the remaining byte into the float analog value
+						ts: std::time::Instant::now(),
+					}
 				})
 				.collect(),
 		))
@@ -240,7 +245,12 @@ impl DeviceImplementation for Wooting60HE {
 struct Wooting60HEARM();
 
 // mess
-pub type ReadKey = (u16, f32);
+pub struct ReadKey {
+	pub code: u16,
+	pub value: f32,
+	pub ts: std::time::Instant,
+}
+
 const READ_CHANNEL_BUF_SIZE: usize = 4;
 
 impl DeviceImplementation for Wooting60HEARM {
@@ -276,6 +286,8 @@ impl Device {
 		// let buffer: Arc<Mutex<HashMap<c_ushort, c_float>>> =
 		//     Arc::new(Mutex::new(Default::default()));
 		let connected = Arc::new(AtomicBool::new(true));
+
+		device.set_blocking_mode(true).unwrap();
 
 		let worker = {
 			//let t_buffer = Arc::clone(&buffer);
@@ -373,7 +385,7 @@ impl Drop for Device {
 pub struct WootingPlugin {
 	initialised: bool,
 	device_event_cb: Arc<Mutex<Option<Box<dyn Fn(DeviceEventType, &DeviceInfo) + Send>>>>,
-	devices: Arc<Mutex<HashMap<DeviceID, Device>>>,
+	devices: Arc<Mutex<HashMap<DeviceID, (Device, EvdevDevice)>>>,
 	timer: Timer,
 	worker_guard: Option<Guard>,
 }
@@ -421,7 +433,9 @@ impl WootingPlugin {
 	fn init_worker(&mut self) -> SDKResult<(u32, std::sync::mpsc::Receiver<Vec<ReadKey>>)> {
 		let (tx, rx) = std::sync::mpsc::sync_channel(READ_CHANNEL_BUF_SIZE);
 		let init_device_closure = |hid: &HidApi,
-		                           devices: &Arc<Mutex<HashMap<DeviceID, Device>>>,
+		                           devices: &Arc<
+			Mutex<HashMap<DeviceID, (Device, EvdevDevice)>>,
+		>,
 		                           device_event_cb: &Arc<
 			Mutex<Option<Box<dyn Fn(DeviceEventType, &DeviceInfo) + Send>>>,
 		>,
@@ -443,39 +457,44 @@ impl WootingPlugin {
 							.contains_key(&device_impl.get_device_id(device_info))
 					{
 						// info!("Found device impl match: {:?}", device_info);
+						let evdev_path = find_evdev(device_info.product_id());
 
-						match device_info.open_device(&hid) {
-							Ok(dev) => {
-								let (id, device) =
-									Device::new(device_info, dev, device_impl, tx.clone());
-								{
-									devices.lock().unwrap().insert(id, device);
-								}
+						let dev = match device_info.open_device(&hid) {
+							Ok(dev) => dev,
 
-								info!(
-									"Found and opened the {:?} successfully!",
-									device_info.product_string()
-								);
-
-								device_event_cb.lock().unwrap().as_ref().and_then(|cb| {
-									cb(
-										DeviceEventType::Connected,
-										devices
-											.lock()
-											.unwrap()
-											.get(&id)
-											.unwrap()
-											.device_info
-											.borrow(),
-									);
-									Some(0)
-								});
-							}
 							Err(e) => {
 								error!("Error opening HID Device: {}", e);
+								continue;
 								//return WootingAnalogResult::Failure.into();
 							}
+						};
+
+						let (id, device) = Device::new(device_info, dev, device_impl, tx.clone());
+						let ev = EvdevDevice::new(&evdev_path);
+
+						{
+							devices.lock().unwrap().insert(id, (device, ev));
 						}
+
+						info!(
+							"Found and opened the {:?} successfully!",
+							device_info.product_string()
+						);
+
+						device_event_cb.lock().unwrap().as_ref().and_then(|cb| {
+							cb(
+								DeviceEventType::Connected,
+								devices
+									.lock()
+									.unwrap()
+									.get(&id)
+									.unwrap()
+									.0
+									.device_info
+									.borrow(),
+							);
+							Some(0)
+						});
 					}
 				}
 			}
@@ -506,14 +525,14 @@ impl WootingPlugin {
 					//Check if any of the devices have disconnected and get rid of them if they have
 					{
 						let mut disconnected: Vec<u64> = vec![];
-						for (&id, device) in t_devices.lock().unwrap().iter() {
+						for (&id, (device, ev)) in t_devices.lock().unwrap().iter() {
 							if !device.connected.load(Ordering::Relaxed) {
 								disconnected.push(id);
 							}
 						}
 
 						for id in disconnected.iter() {
-							let device = t_devices.lock().unwrap().remove(id).unwrap();
+							let (device, ev) = t_devices.lock().unwrap().remove(id).unwrap();
 							t_device_event_cb.lock().unwrap().as_ref().and_then(|cb| {
 								cb(DeviceEventType::Disconnected, &device.device_info);
 								Some(0)
@@ -647,11 +666,74 @@ impl WootingPlugin {
 		}
 
 		let mut devices = vec![];
-		for (_id, device) in self.devices.lock().unwrap().iter() {
+		for (_id, (device, _)) in self.devices.lock().unwrap().iter() {
 			devices.push(device.device_info.clone());
 		}
 
 		Ok(devices).into()
+	}
+}
+
+fn find_evdev(product_id: u16) -> std::path::PathBuf {
+	use input_linux;
+	use std::os::unix::ffi::OsStringExt;
+	let des = std::fs::read_dir("/dev/input").unwrap();
+	let evdev_direntries = des.into_iter().filter_map(|f| {
+		let de = f.unwrap();
+		if de.file_name().to_string_lossy().starts_with("event") {
+			Some(de.path())
+		} else {
+			None
+		}
+	});
+	let mut found_keyboards = evdev_direntries
+		.filter_map(|path| {
+			let fd = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+			let ev = input_linux::EvdevHandle::new(fd);
+			let id = ev.device_id().unwrap();
+			if id.vendor != WOOTING_VID && id.product != product_id {
+				return None;
+			}
+			let e = ev.key_bits().unwrap();
+			if !e
+				.into_iter()
+				.collect::<Vec<_>>()
+				.contains(&input_linux::Key::A)
+			{
+				return None;
+			}
+			Some((path, ev))
+		})
+		.collect::<Vec<_>>();
+
+	if found_keyboards.len() != 1 {
+		panic!("found 0 or multiple evdev candidates for keyboard!")
+	}
+	let (path, kb) = found_keyboards.remove(0);
+
+	let id = kb.device_id().unwrap();
+	let phys = &std::ffi::OsString::from_vec(kb.device_name().unwrap());
+	let name = &std::ffi::OsString::from_vec(kb.physical_location().unwrap());
+	log::info!("{phys:?} {name:? }{id:#?}");
+	drop(kb);
+
+	return path;
+}
+
+struct EvdevDevice {
+	h: input_linux::EvdevHandle<std::fs::File>,
+}
+impl EvdevDevice {
+	fn new(path: &PathBuf) -> Self {
+		let fd = std::fs::OpenOptions::new()
+			.read(true)
+			.open(path)
+			.expect(&format!("couldn\'t open {path:?}"));
+
+		let h = input_linux::EvdevHandle::new(fd);
+		h.grab(true).unwrap();
+
+		EvdevDevice { h }
 	}
 }
 

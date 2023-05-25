@@ -9,12 +9,15 @@ links = "hidapi-hidraw"
 
 [dependencies]
 anyhow = "1.0.71"
+bimap = "0.6.3"
 chrono = "0.4.24"
 env_logger = "0.10.0"
 hidapi = { version = "2.3.3", features = [
 	"linux-static-hidraw",
 ], default-features = false }
+input-linux = "0.6.0"
 lazy_static = "1.4.0"
+libc = "0.2.144"
 
 log = "0.4.17"
 serde = { version = "1.0.163", features = ["derive"] }
