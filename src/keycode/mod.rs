@@ -1,5 +1,7 @@
 extern crate lazy_static;
 
+use std::collections::HashSet;
+
 use bimap::BiMap;
 use lazy_static::lazy_static;
 
@@ -225,6 +227,29 @@ lazy_static! {
 		bimap.insert(0x69, 0x0049); //NUMPAD9
 		bimap.insert(0x6E, 0x0053); //NUMPAD_DECIMAL
 		bimap
+	};
+
+	pub static ref SHOUTABLE_HIDCODES: HashSet::<u8> = {
+		let mut s: HashSet::<u8> = HashSet::<u8>::new();
+		for hidcode in 0x04..=0x27 { // A-Z, 1-9, 0
+			s.insert(hidcode);
+		}
+		for hidcode in 0x2d..=0x31 { // -=[]\
+			s.insert(hidcode);
+		}
+		for hidcode in 0x33..=0x38 { // ;'`,./
+			s.insert(hidcode);
+		}
+		s
+	};
+
+	pub static ref SHOUTABLE_SCANCODES: HashSet::<u16> = {
+		let mut s: HashSet::<u16> = HashSet::<u16>::new();
+		for hidcode in SHOUTABLE_HIDCODES.iter() {
+			let c = u16::from(*hidcode);
+			s.insert(hid_to_scancode(c).unwrap());
+		}
+		s
 	};
 
 }

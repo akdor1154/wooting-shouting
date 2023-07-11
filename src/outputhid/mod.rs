@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use input_linux::{uinput, InputEvent};
 
-use crate::watcher::KeyEvent;
+use crate::{hid, watcher::KeyEvent};
 pub struct OutputHid {
 	handle: input_linux::uinput::UInputHandle<std::fs::File>,
 }
@@ -44,7 +44,7 @@ impl OutputHid {
 		return OutputHid { handle };
 	}
 	pub fn send_key(&mut self, k: &KeyEvent) {
-		let code = k.code;
+		let code = k.scancode;
 		let velocity = k.velocity;
 		let time = input_linux::EventTime::new(0, 0);
 		let Ok(key) = input_linux::Key::from_code(code) else {
@@ -145,5 +145,9 @@ impl OutputHid {
 				])
 				.unwrap();
 		}
+	}
+
+	pub fn send_passthrough(&self, evs: &[input_linux::sys::input_event]) {
+		self.handle.write(evs).unwrap();
 	}
 }

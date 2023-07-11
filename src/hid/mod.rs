@@ -25,6 +25,8 @@ use std::{str, thread};
 use timer::{Guard, Timer};
 use wooting_analog_plugin_dev::wooting_analog_common::*;
 
+use crate::keycode::{self, SHOUTABLE_HIDCODES};
+
 extern crate env_logger;
 
 const ANALOG_BUFFER_SIZE: usize = 48;
@@ -76,7 +78,7 @@ trait DeviceImplementation: Send + Sync {
 		&self,
 		device: &HidDevice,
 		max_length: usize,
-	) -> Result<Option<Vec<ReadKey>>, ReadErrors> {
+	) -> Result<Option<Vec<AnalogueReading>>, ReadErrors> {
 		let mut buffer: [u8; ANALOG_BUFFER_SIZE] = [0; ANALOG_BUFFER_SIZE];
 		let res = device.read_timeout(&mut buffer, -1);
 
@@ -98,13 +100,18 @@ trait DeviceImplementation: Send + Sync {
 			buffer
 				.chunks_exact(3) //Split it into groups of 3 as the analog report is in the format of 2 byte code + 1 byte analog value
 				//.take(max_length) //Only take up to the max length of results. Doing this
-				.filter(|&s| s[0] != 0 || s[1] != 0) //Get rid of entries where the code is 0
-				.map(|s| {
-					ReadKey {
-						code: ((u16::from(s[0])) << 8) | u16::from(s[1]), // Convert the first 2 bytes into the u16 code
+				.filter(|&s| s[0] != 0 || s[1] != 0) //Get rid of entries where the code is 0 l
+				.filter_map(|s| {
+					let hidcode = ((u16::from(s[0])) << 8) | u16::from(s[1]); // Convert the first 2 bytes into the u16 code
+					let scancode = keycode::hid_to_scancode(hidcode).unwrap();
+					if !keycode::SHOUTABLE_SCANCODES.contains(&scancode) {
+						return None;
+					}
+					Some(AnalogueReading {
+						scancode,
 						value: self.analog_value_to_float(s[2]), //Convert the remaining byte into the float analog value
 						ts: std::time::Instant::now(),
-					}
+					})
 				})
 				.collect(),
 		))
@@ -245,13 +252,22 @@ impl DeviceImplementation for Wooting60HE {
 struct Wooting60HEARM();
 
 // mess
-pub struct ReadKey {
-	pub code: u16,
+pub struct AnalogueReading {
+	pub scancode: u16,
 	pub value: f32,
 	pub ts: std::time::Instant,
 }
 
-const READ_CHANNEL_BUF_SIZE: usize = 4;
+pub struct PassThroughEvdev {
+	pub scancode: u16,
+	pub value: i32,
+	pub ts: std::time::Instant,
+}
+
+pub enum Input {
+	Analogue(Vec<AnalogueReading>),
+	PassThrough(Vec<input_linux::sys::input_event>),
+}
 
 impl DeviceImplementation for Wooting60HEARM {
 	fn device_hardware_id(&self) -> DeviceHardwareID {
@@ -279,7 +295,7 @@ impl Device {
 		device_info: &DeviceInfoHID,
 		device: HidDevice,
 		device_impl: &'static Box<dyn DeviceImplementation>,
-		sender: SyncSender<Vec<ReadKey>>,
+		sender: SyncSender<Input>,
 	) -> (DeviceID, Self) {
 		let id_hash = device_impl.get_device_id(device_info);
 
@@ -303,7 +319,7 @@ impl Device {
 					.into()
 				{
 					Ok(Some(data)) => {
-						if let Err(e) = sender.send(data) {
+						if let Err(e) = sender.send(Input::Analogue(data)) {
 							error!("Sending failed, disconnected? {e:?}");
 							panic!("bang")
 						}
@@ -384,6 +400,7 @@ impl Drop for Device {
 
 pub struct WootingPlugin {
 	initialised: bool,
+	tx: SyncSender<Input>,
 	device_event_cb: Arc<Mutex<Option<Box<dyn Fn(DeviceEventType, &DeviceInfo) + Send>>>>,
 	devices: Arc<Mutex<HashMap<DeviceID, (Device, EvdevDevice)>>>,
 	timer: Timer,
@@ -406,9 +423,10 @@ static ref DEVICE_IMPLS: Vec<Box<dyn DeviceImplementation>> = vec![
 
 const PLUGIN_NAME: &str = "Wooting Official Plugin";
 impl WootingPlugin {
-	pub fn new() -> Self {
+	pub fn new(tx: SyncSender<Input>) -> Self {
 		WootingPlugin {
 			initialised: false,
+			tx: tx,
 			device_event_cb: Arc::new(Mutex::new(None)),
 			devices: Arc::new(Mutex::new(Default::default())),
 			timer: timer::Timer::new(),
@@ -419,7 +437,7 @@ impl WootingPlugin {
 	pub fn initialise(
 		&mut self,
 		callback: Box<dyn Fn(DeviceEventType, &DeviceInfo) + Send>,
-	) -> SDKResult<(u32, std::sync::mpsc::Receiver<Vec<ReadKey>>)> {
+	) -> SDKResult<u32> {
 		if let Err(e) = env_logger::try_init() {
 			log::warn!("Unable to initialize Env Logger: {}", e);
 		}
@@ -430,8 +448,7 @@ impl WootingPlugin {
 		ret
 	}
 
-	fn init_worker(&mut self) -> SDKResult<(u32, std::sync::mpsc::Receiver<Vec<ReadKey>>)> {
-		let (tx, rx) = std::sync::mpsc::sync_channel(READ_CHANNEL_BUF_SIZE);
+	fn init_worker(&mut self) -> SDKResult<u32> {
 		let init_device_closure = |hid: &HidApi,
 		                           devices: &Arc<
 			Mutex<HashMap<DeviceID, (Device, EvdevDevice)>>,
@@ -439,7 +456,7 @@ impl WootingPlugin {
 		                           device_event_cb: &Arc<
 			Mutex<Option<Box<dyn Fn(DeviceEventType, &DeviceInfo) + Send>>>,
 		>,
-		                           tx: SyncSender<Vec<ReadKey>>| {
+		                           tx: SyncSender<Input>| {
 			let device_infos: Vec<&DeviceInfoHID> = hid.device_list().collect();
 
 			for device_info in device_infos.iter() {
@@ -470,7 +487,7 @@ impl WootingPlugin {
 						};
 
 						let (id, device) = Device::new(device_info, dev, device_impl, tx.clone());
-						let ev = EvdevDevice::new(&evdev_path);
+						let ev = EvdevDevice::new(&evdev_path, tx.clone());
 
 						{
 							devices.lock().unwrap().insert(id, (device, ev));
@@ -515,11 +532,12 @@ impl WootingPlugin {
 		};
 
 		//We wanna call it in this thread first so we can get hold of any connected devices now so we can return an accurate result for initialise
-		init_device_closure(&hid, &self.devices, &self.device_event_cb, tx.clone());
+		init_device_closure(&hid, &self.devices, &self.device_event_cb, self.tx.clone());
 
 		self.worker_guard = Some({
 			let t_devices = Arc::clone(&self.devices);
 			let t_device_event_cb = Arc::clone(&self.device_event_cb);
+			let tx = self.tx.clone();
 			self.timer
 				.schedule_repeating(chrono::Duration::milliseconds(500), move || {
 					//Check if any of the devices have disconnected and get rid of them if they have
@@ -547,7 +565,7 @@ impl WootingPlugin {
 				})
 		});
 		log::debug!("Started timer");
-		Ok((self.devices.lock().unwrap().len() as u32, rx)).into()
+		Ok(self.devices.lock().unwrap().len() as u32).into()
 	}
 }
 
@@ -721,10 +739,11 @@ fn find_evdev(product_id: u16) -> std::path::PathBuf {
 }
 
 struct EvdevDevice {
-	h: input_linux::EvdevHandle<std::fs::File>,
+	//h: input_linux::EvdevHandle<std::fs::File>,
+	worker: JoinHandle<u8>,
 }
 impl EvdevDevice {
-	fn new(path: &PathBuf) -> Self {
+	fn new(path: &PathBuf, tx: SyncSender<Input>) -> Self {
 		let fd = std::fs::OpenOptions::new()
 			.read(true)
 			.open(path)
@@ -733,7 +752,60 @@ impl EvdevDevice {
 		let h = input_linux::EvdevHandle::new(fd);
 		h.grab(true).unwrap();
 
-		EvdevDevice { h }
+		let connected = Arc::new(AtomicBool::new(true));
+
+		let sender = tx.clone();
+
+		let worker = {
+			let t_connected = Arc::clone(&connected);
+			let mut buf: [input_linux::sys::input_event; 64] = [input_linux::sys::input_event {
+				time: libc::timeval {
+					tv_sec: 0,
+					tv_usec: 0,
+				},
+				type_: 0,
+				code: 0,
+				value: 0,
+			}; 64];
+
+			thread::spawn(move || loop {
+				if !t_connected.load(Ordering::Relaxed) {
+					return 0;
+				}
+
+				let events = match h.read(&mut buf) {
+					Ok(len) => &buf[0..len],
+					Err(e) => {
+						error!("Read failed from evdev, {:?}. Disconnecting device...", e);
+						t_connected.store(false, Ordering::Relaxed);
+						return 0;
+					}
+				};
+
+				let events = events
+					.iter()
+					.filter_map(|e| {
+						if e.type_ == u16::try_from(input_linux::sys::EV_SYN).unwrap() {
+							return Some(*e);
+						}
+						if e.type_ != u16::try_from(input_linux::sys::EV_KEY).unwrap() {
+							return None;
+						}
+						if keycode::SHOUTABLE_SCANCODES.contains(&e.code) {
+							return None;
+						}
+						return Some(*e);
+					})
+					.collect();
+
+				if let Err(e) = tx.try_send(Input::PassThrough(events)) {
+					error!("error sending, disconnected? {e:#?}");
+					panic!("bang");
+				}
+			})
+		};
+
+		EvdevDevice { worker }
 	}
 }
 

@@ -13,6 +13,7 @@ enum KeyState {
 	PressStarted {
 		start_time: std::time::Instant,
 		current_value: f32,
+		current_time: std::time::Instant,
 	},
 	PressFired,
 }
@@ -23,23 +24,20 @@ pub struct KeyWatcher {
 }
 
 pub struct KeyEvent {
-	pub code: u16,
+	pub scancode: u16,
 	pub caps: bool,
 	pub velocity: f32,
 }
 
-const THRESHOLD: f32 = 0.90;
+const THRESHOLD_LOW: f32 = 0.4;
+const THRESHOLD: f32 = 0.92;
 
 impl KeyWatcher {
-	pub fn new() -> (Self, std::sync::mpsc::Receiver<KeyEvent>) {
-		let (tx, rx) = std::sync::mpsc::sync_channel::<KeyEvent>(0);
-		return (
-			Self {
-				keys: HashMap::<_, _>::with_capacity(255),
-				tx: tx,
-			},
-			rx,
-		);
+	pub fn new(tx: std::sync::mpsc::SyncSender<KeyEvent>) -> Self {
+		return Self {
+			keys: HashMap::<_, _>::with_capacity(255),
+			tx: tx,
+		};
 	}
 	fn get_key_state(&mut self, code: u16) -> &mut KeyState {
 		if !self.keys.contains_key(&code) {
@@ -48,8 +46,12 @@ impl KeyWatcher {
 		return self.keys.get_mut(&code).unwrap();
 	}
 
-	pub fn take_input(&mut self, input: &hid::ReadKey) {
-		let hid::ReadKey { code, value, ts } = input;
+	pub fn take_input(&mut self, input: &hid::AnalogueReading) {
+		let hid::AnalogueReading {
+			scancode: code,
+			value,
+			ts,
+		} = input;
 		let tx = &self.tx.clone();
 		let s = self.get_key_state(*code);
 
@@ -62,21 +64,29 @@ impl KeyWatcher {
 				KeyState::PressStarted {
 					start_time,
 					current_value,
+					current_time,
 				},
 				_,
 			) => {
 				// started release
-				if *value > THRESHOLD {
-					let tdiff = *ts - *start_time;
-
+				let diff = *value - *current_value;
+				if *value > THRESHOLD // key nearly fully depressed
+				|| diff < 0.0 && *value > THRESHOLD_LOW
+				// started release
+				// key has begun to be depressed
+				{
 					let last_value = *current_value;
+					let last_time = *current_time;
 
-					let diff = (*value - last_value) / tdiff.as_secs_f32();
+					let tdiff = *ts - *start_time;
+					//let tdiff = *ts - last_time;
+
+					let velocity = (*value - 0.0) / tdiff.as_secs_f32();
 
 					tx.send(KeyEvent {
-						code: *code,
-						caps: (diff > 50.0),
-						velocity: diff,
+						scancode: *code,
+						caps: (velocity > 180.0),
+						velocity,
 					})
 					.unwrap();
 					*s = KeyState::PressFired
@@ -84,6 +94,7 @@ impl KeyWatcher {
 					*s = KeyState::PressStarted {
 						start_time: *start_time,
 						current_value: *value,
+						current_time: *ts,
 					};
 				}
 			}
@@ -97,6 +108,7 @@ impl KeyWatcher {
 				*s = KeyState::PressStarted {
 					start_time: *ts,
 					current_value: *value,
+					current_time: *ts,
 				};
 			}
 			(KeyState::Released, false) => {
