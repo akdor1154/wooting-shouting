@@ -20,7 +20,7 @@ enum KeyState {
 
 pub struct KeyWatcher {
 	keys: HashMap<u16, KeyState>,
-	tx: std::sync::mpsc::SyncSender<KeyEvent>,
+	tx: std::sync::mpsc::SyncSender<crate::OutputHidEvent>,
 }
 
 pub struct KeyEvent {
@@ -33,7 +33,7 @@ const THRESHOLD_LOW: f32 = 0.4;
 const THRESHOLD: f32 = 0.92;
 
 impl KeyWatcher {
-	pub fn new(tx: std::sync::mpsc::SyncSender<KeyEvent>) -> Self {
+	pub fn new(tx: std::sync::mpsc::SyncSender<crate::OutputHidEvent>) -> Self {
 		return Self {
 			keys: HashMap::<_, _>::with_capacity(255),
 			tx: tx,
@@ -83,11 +83,11 @@ impl KeyWatcher {
 
 					let velocity = (*value - 0.0) / tdiff.as_secs_f32();
 
-					tx.send(KeyEvent {
+					tx.send(crate::OutputHidEvent::Key(KeyEvent {
 						scancode: *code,
 						caps: (velocity > 180.0),
 						velocity,
-					})
+					}))
 					.unwrap();
 					*s = KeyState::PressFired
 				} else {

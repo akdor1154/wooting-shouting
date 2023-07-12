@@ -80,42 +80,49 @@ trait DeviceImplementation: Send + Sync {
 		max_length: usize,
 	) -> Result<Option<Vec<AnalogueReading>>, ReadErrors> {
 		let mut buffer: [u8; ANALOG_BUFFER_SIZE] = [0; ANALOG_BUFFER_SIZE];
-		let res = device.read_timeout(&mut buffer, -1);
+		let res = device.read_timeout(&mut buffer, 100);
+		let ts = std::time::Instant::now();
 
-		match res {
+		let len = match res {
 			Ok(len) => {
 				// If the length is 0 then that means the read timed out, so we shouldn't use it to update values
 				if len == 0 {
 					return Ok(None).into();
 				}
+				len
 			}
 			Err(e) => {
 				error!("Failed to read buffer: {}", e);
 
 				return Err(ReadErrors::DeviceDisconnected);
 			}
-		}
+		};
 		//println!("{:?}", buffer);
-		Ok(Some(
-			buffer
-				.chunks_exact(3) //Split it into groups of 3 as the analog report is in the format of 2 byte code + 1 byte analog value
-				//.take(max_length) //Only take up to the max length of results. Doing this
-				.filter(|&s| s[0] != 0 || s[1] != 0) //Get rid of entries where the code is 0 l
-				.filter_map(|s| {
-					let hidcode = ((u16::from(s[0])) << 8) | u16::from(s[1]); // Convert the first 2 bytes into the u16 code
-					let scancode = keycode::hid_to_scancode(hidcode).unwrap();
-					if !keycode::SHOUTABLE_SCANCODES.contains(&scancode) {
-						return None;
-					}
-					Some(AnalogueReading {
-						scancode,
-						value: self.analog_value_to_float(s[2]), //Convert the remaining byte into the float analog value
-						ts: std::time::Instant::now(),
-					})
-				})
-				.collect(),
-		))
+
+		//Split it into groups of 3 as the analog report is in the format of 2 byte code + 1 byte analog value
+		let mut readings = Vec::<AnalogueReading>::with_capacity(len/3 + 1);
+
+		for s in buffer.chunks_exact(3) {
+			let hidcode = ((u16::from(s[0])) << 8) | u16::from(s[1]); // Convert the first 2 bytes into the u16 code
+
+			if hidcode == 0 { continue; } //Get rid of entries where the code is 0
+
+			let scancode = keycode::hid_to_scancode(hidcode).unwrap();
+			if !keycode::SHOUTABLE_SCANCODES.contains(&scancode) {
+				continue;
+			}
+
+			readings.push(AnalogueReading {
+				scancode,
+				value: self.analog_value_to_float(s[2]), //Convert the remaining byte into the float analog value
+				ts: ts,
+			});
+
+		}
+
+		Ok(Some(readings))
 	}
+
 
 	/// Get the unique device ID from the given `device_info`
 	fn get_device_id(&self, device_info: &DeviceInfoHID) -> DeviceID {
@@ -252,6 +259,7 @@ impl DeviceImplementation for Wooting60HE {
 struct Wooting60HEARM();
 
 // mess
+#[derive(Clone)]
 pub struct AnalogueReading {
 	pub scancode: u16,
 	pub value: f32,
@@ -267,6 +275,7 @@ pub struct PassThroughEvdev {
 pub enum Input {
 	Analogue(Vec<AnalogueReading>),
 	PassThrough(Vec<input_linux::sys::input_event>),
+	Fin(),
 }
 
 impl DeviceImplementation for Wooting60HEARM {
@@ -286,7 +295,7 @@ struct Device {
 	//sender: SyncSender<Vec<ReadKey>>,
 	connected: Arc<AtomicBool>,
 	pressed_keys: Vec<u16>,
-	worker: Option<JoinHandle<i32>>,
+	worker: Option<JoinHandle<()>>,
 }
 unsafe impl Send for Device {}
 
@@ -309,30 +318,35 @@ impl Device {
 			//let t_buffer = Arc::clone(&buffer);
 			let t_connected = Arc::clone(&connected);
 
-			thread::spawn(move || loop {
-				if !t_connected.load(Ordering::Relaxed) {
-					return 0;
-				}
+			thread::spawn(move || {
+				info!("looping!");
+				loop {
+					if !t_connected.load(Ordering::Relaxed) {
+						break;
+					}
 
-				match device_impl
-					.get_analog_buffer(&device, ANALOG_MAX_SIZE)
-					.into()
-				{
-					Ok(Some(data)) => {
-						if let Err(e) = sender.send(Input::Analogue(data)) {
-							error!("Sending failed, disconnected? {e:?}");
-							panic!("bang")
+					match device_impl
+						.get_analog_buffer(&device, ANALOG_MAX_SIZE)
+						.into()
+					{
+						Ok(Some(data)) => {
+							if let Err(e) = sender.send(Input::Analogue(data)) {
+								error!("Sending failed, disconnected? {e:?}");
+								panic!("bang")
+							}
 						}
-					}
-					Ok(None) => {}
-					Err(e) => {
-						if e != ReadErrors::DeviceDisconnected {
-							error!("Read failed from device that isn't DeviceDisconnected, we got {:?}. Disconnecting device...", e);
+						Ok(None) => {}
+						Err(e) => {
+							if e != ReadErrors::DeviceDisconnected {
+								error!("Read failed from device that isn't DeviceDisconnected, we got {:?}. Disconnecting device...", e);
+							}
+							t_connected.store(false, Ordering::Relaxed);
+							break;
 						}
-						t_connected.store(false, Ordering::Relaxed);
-						return 0;
 					}
 				}
+				info!("dropping!");
+				drop(sender);
 			})
 		};
 
@@ -578,8 +592,11 @@ impl WootingPlugin {
 		self.initialised
 	}
 
-	fn unload(&mut self) {
-		self.devices.lock().unwrap().drain();
+	pub fn unload(&mut self) {
+
+		{
+			self.devices.try_lock().unwrap().drain();
+		}
 		drop(self.worker_guard.take());
 		self.initialised = false;
 
@@ -740,7 +757,7 @@ fn find_evdev(product_id: u16) -> std::path::PathBuf {
 
 struct EvdevDevice {
 	//h: input_linux::EvdevHandle<std::fs::File>,
-	worker: JoinHandle<u8>,
+	worker: JoinHandle<()>,
 }
 impl EvdevDevice {
 	fn new(path: &PathBuf, tx: SyncSender<Input>) -> Self {
@@ -754,8 +771,6 @@ impl EvdevDevice {
 
 		let connected = Arc::new(AtomicBool::new(true));
 
-		let sender = tx.clone();
-
 		let worker = {
 			let t_connected = Arc::clone(&connected);
 			let mut buf: [input_linux::sys::input_event; 64] = [input_linux::sys::input_event {
@@ -768,40 +783,43 @@ impl EvdevDevice {
 				value: 0,
 			}; 64];
 
-			thread::spawn(move || loop {
-				if !t_connected.load(Ordering::Relaxed) {
-					return 0;
-				}
-
-				let events = match h.read(&mut buf) {
-					Ok(len) => &buf[0..len],
-					Err(e) => {
-						error!("Read failed from evdev, {:?}. Disconnecting device...", e);
-						t_connected.store(false, Ordering::Relaxed);
-						return 0;
+			thread::spawn(move || {
+				loop {
+					if !t_connected.load(Ordering::Relaxed) {
+						break;
 					}
-				};
 
-				let events = events
-					.iter()
-					.filter_map(|e| {
-						if e.type_ == u16::try_from(input_linux::sys::EV_SYN).unwrap() {
+					let events = match h.read(&mut buf) {
+						Ok(len) => &buf[0..len],
+						Err(e) => {
+							error!("Read failed from evdev, {:?}. Disconnecting device...", e);
+							t_connected.store(false, Ordering::Relaxed);
+							break;
+						}
+					};
+
+					let events = events
+						.iter()
+						.filter_map(|e| {
+							if e.type_ == u16::try_from(input_linux::sys::EV_SYN).unwrap() {
+								return Some(*e);
+							}
+							if e.type_ != u16::try_from(input_linux::sys::EV_KEY).unwrap() {
+								return None;
+							}
+							if keycode::SHOUTABLE_SCANCODES.contains(&e.code) {
+								return None;
+							}
 							return Some(*e);
-						}
-						if e.type_ != u16::try_from(input_linux::sys::EV_KEY).unwrap() {
-							return None;
-						}
-						if keycode::SHOUTABLE_SCANCODES.contains(&e.code) {
-							return None;
-						}
-						return Some(*e);
-					})
-					.collect();
+						})
+						.collect();
 
-				if let Err(e) = tx.try_send(Input::PassThrough(events)) {
-					error!("error sending, disconnected? {e:#?}");
-					panic!("bang");
+					if let Err(e) = tx.try_send(Input::PassThrough(events)) {
+						error!("error sending, disconnected? {e:#?}");
+						panic!("bang");
+					}
 				}
+				drop(tx);
 			})
 		};
 

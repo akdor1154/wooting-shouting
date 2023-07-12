@@ -3,13 +3,17 @@ use std::time::Duration;
 use input_linux::{uinput, InputEvent};
 
 use crate::{hid, watcher::KeyEvent};
+
 pub struct OutputHid {
 	handle: input_linux::uinput::UInputHandle<std::fs::File>,
+	epoch: std::time::Instant
 }
 
 impl OutputHid {
 	pub fn new() -> Self {
 		use std::os::unix::fs::OpenOptionsExt;
+
+		let epoch = std::time::Instant::now();
 
 		let uinput_file = std::fs::OpenOptions::new()
 			.read(true)
@@ -41,12 +45,15 @@ impl OutputHid {
 
 		handle.create(&input_id, device_name, 0, &[]).unwrap();
 
-		return OutputHid { handle };
+		return OutputHid { handle, epoch };
 	}
 	pub fn send_key(&mut self, k: &KeyEvent) {
 		let code = k.scancode;
 		let velocity = k.velocity;
-		let time = input_linux::EventTime::new(0, 0);
+		let mut t = std::time::Instant::now().duration_since(self.epoch);
+		let get_time = |t: std::time::Duration| {
+			input_linux::EventTime::new(t.as_secs().try_into().unwrap(), t.subsec_millis().try_into().unwrap())
+		};
 		let Ok(key) = input_linux::Key::from_code(code) else {
 			log::warn!("ignoring bad code {code}");
 			return;
@@ -58,7 +65,7 @@ impl OutputHid {
 		if k.caps {
 			self.handle
 				.write(&[*input_linux::InputEvent::from(input_linux::KeyEvent::new(
-					time,
+					get_time(t),
 					input_linux::Key::LeftShift,
 					input_linux::KeyState::PRESSED,
 				))
@@ -68,7 +75,7 @@ impl OutputHid {
 			self.handle
 				.write(&[
 					*input_linux::InputEvent::from(input_linux::SynchronizeEvent::new(
-						time,
+						get_time(t),
 						input_linux::SynchronizeKind::Report,
 						0,
 					))
@@ -76,12 +83,13 @@ impl OutputHid {
 				])
 				.unwrap();
 
-			std::thread::sleep(Duration::from_millis(15));
+			std::thread::sleep(Duration::from_millis(5));
+			t = t + Duration::from_millis(5);
 		}
 
 		self.handle
 			.write(&[*input_linux::InputEvent {
-				time: time,
+				time: get_time(t),
 				kind: input_linux::EventKind::Key,
 				code: code,
 				value: 1,
@@ -92,7 +100,7 @@ impl OutputHid {
 		self.handle
 			.write(&[
 				*input_linux::InputEvent::from(input_linux::SynchronizeEvent::new(
-					time,
+					get_time(t),
 					input_linux::SynchronizeKind::Report,
 					0,
 				))
@@ -100,11 +108,12 @@ impl OutputHid {
 			])
 			.unwrap();
 
-		std::thread::sleep(Duration::from_millis(15));
+		std::thread::sleep(Duration::from_millis(5));
+		t = t + Duration::from_millis(5);
 
 		self.handle
 			.write(&[*input_linux::InputEvent {
-				time: time,
+				time: get_time(t),
 				kind: input_linux::EventKind::Key,
 				code: code,
 				value: 0,
@@ -115,19 +124,21 @@ impl OutputHid {
 		self.handle
 			.write(&[
 				*input_linux::InputEvent::from(input_linux::SynchronizeEvent::new(
-					time,
+					get_time(t),
 					input_linux::SynchronizeKind::Report,
 					0,
 				))
 				.as_raw(),
 			])
 			.unwrap();
+
 		if k.caps {
-			std::thread::sleep(Duration::from_millis(15));
+			std::thread::sleep(Duration::from_millis(5));
+			t = t + Duration::from_millis(5);
 
 			self.handle
 				.write(&[*input_linux::InputEvent::from(input_linux::KeyEvent::new(
-					time,
+					get_time(t),
 					input_linux::Key::LeftShift,
 					input_linux::KeyState::RELEASED,
 				))
@@ -137,7 +148,7 @@ impl OutputHid {
 			self.handle
 				.write(&[
 					*input_linux::InputEvent::from(input_linux::SynchronizeEvent::new(
-						time,
+						get_time(t),
 						input_linux::SynchronizeKind::Report,
 						0,
 					))

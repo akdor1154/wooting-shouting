@@ -11,6 +11,7 @@ links = "hidapi-hidraw"
 anyhow = "1.0.71"
 bimap = "0.6.3"
 chrono = "0.4.24"
+ctrlc = "3.4.0"
 env_logger = "0.10.0"
 hidapi = { version = "2.3.3", features = [
 	"linux-static-hidraw",
@@ -21,6 +22,7 @@ libc = "0.2.144"
 
 log = "0.4.17"
 serde = { version = "1.0.163", features = ["derive"] }
+sqlite = "0.31.0"
 timer = "0.2.0"
 wooting-analog-plugin-dev = "0.7.1"
 
